@@ -1,0 +1,983 @@
+import os
+import uuid as uuid_lib
+from datetime import UTC, datetime, timedelta
+from typing import Literal
+from urllib.parse import quote, urlsplit
+
+from fastapi import APIRouter, HTTPException, Request, UploadFile, status
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import delete, func, or_, select
+
+from app.api.deps import CurrentAdmin, DbSession
+from app.core.config import settings
+from app.services import telegram
+from app.services.links import normalize_support_link
+from shared.botcopy import CopyError, validate_button
+from app.services.telegram import TelegramError
+from shared import bus
+from shared.crypto import decrypt, encrypt, mask
+from shared.db.models import (
+    AuditLog,
+    BotConfig,
+    BotState,
+    EmojiMode,
+    Payment,
+    PaymentStatus,
+    Plan,
+    PlanCategory,
+    TrafficPackage,
+)
+
+router = APIRouter(prefix="/bot", tags=["bot"])
+
+# Сколько ждать оплату по выставленному счёту: дольше провайдеры счета не
+# держат, а брошенные счета не должны вечно запрещать удаление тарифа.
+PENDING_PAYMENT_WINDOW = timedelta(hours=24)
+
+
+async def ensure_no_open_payments(db, condition, what: str) -> None:
+    """Не даёт удалить тариф или пакет, по которому есть неприменённая
+    оплата. После удаления ссылка в платеже обнуляется, и бот уже не знает,
+    что выдавать: клиент заплатил, а доступ не получает никогда."""
+    cutoff = datetime.now(UTC) - PENDING_PAYMENT_WINDOW
+    count = await db.scalar(
+        select(func.count())
+        .select_from(Payment)
+        .where(
+            condition,
+            Payment.applied_at.is_(None),
+            or_(
+                Payment.status == PaymentStatus.PAID,
+                (Payment.status == PaymentStatus.PENDING) & (Payment.created_at >= cutoff),
+            ),
+        )
+    )
+    if count:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"По этому {what} есть незавершённые оплаты ({count}). Отключите его "
+            "вместо удаления — клиенты не увидят его в боте, а начатые оплаты "
+            "довыдадутся. Удалить можно будет через сутки.",
+        )
+
+
+async def _config(db: DbSession) -> BotConfig:
+    row = await db.get(BotConfig, 1)
+    if row is None:
+        row = BotConfig(id=1)
+        db.add(row)
+        await db.flush()
+    return row
+
+
+def _audit(db, admin, action: str, request: Request, **details) -> None:
+    db.add(
+        AuditLog(
+            admin_id=admin.id,
+            action=action,
+            details=details or None,
+            ip=request.client.host if request.client else None,
+            created_at=datetime.now(UTC),
+        )
+    )
+
+
+# ── Состояние ─────────────────────────────────────────────────────────
+class BotStatusOut(BaseModel):
+    configured: bool
+    enabled: bool
+    state: str
+    state_message: str | None
+    token_masked: str | None
+    proxy_masked: str | None
+    bot_username: str | None
+    bot_name: str | None
+    started_at: datetime | None
+
+    emoji_mode: str
+    premium_available: bool
+    premium_emoji: dict[str, str]
+
+    welcome_text: str | None
+    support_url: str | None
+    channel_url: str | None
+    channel_id: str | None
+    require_channel_sub: bool
+
+    trial_enabled: bool
+    trial_days: int
+    trial_squad_uuids: list[str]
+    trial_hwid_limit: int
+    trial_traffic_gb: int
+
+    node_alerts_enabled: bool
+    node_alerts_chat_id: int | None
+
+    purchase_notify_chat_id: int | None
+    admin_telegram_ids: list[int]
+    privacy_policy_url: str | None
+    terms_url: str | None
+
+    # Картинка над экранами бота: имя файла и ссылка для предпросмотра.
+    menu_photo: str | None
+    menu_photo_url: str | None
+    allow_multiple_subscriptions: bool
+    menu_hidden: list[str]
+    menu_columns: int
+    menu_styles: dict[str, str]
+    menu_mode: str
+    menu_labels: dict[str, str]
+    support_mode: str
+    # Когда бот в последний раз применил настройки (панель ждёт этой отметки).
+    config_applied_at: datetime | None
+    discount_percent: int
+    discount_until: datetime | None
+
+
+def _status(row: BotConfig) -> BotStatusOut:
+    token = decrypt(row.token_encrypted) if row.token_encrypted else None
+    return BotStatusOut(
+        configured=bool(token),
+        enabled=row.enabled,
+        state=str(row.state),
+        state_message=row.state_message,
+        token_masked=mask(token) if token else None,
+        proxy_masked=_proxy_masked(row),
+        bot_username=row.bot_username,
+        bot_name=row.bot_name,
+        started_at=row.started_at,
+        emoji_mode=str(row.emoji_mode),
+        premium_available=row.premium_available,
+        premium_emoji=row.premium_emoji or {},
+        welcome_text=row.welcome_text,
+        support_url=row.support_url,
+        channel_url=row.channel_url,
+        channel_id=row.channel_id,
+        require_channel_sub=row.require_channel_sub,
+        trial_enabled=row.trial_enabled,
+        trial_days=row.trial_days,
+        trial_squad_uuids=list(row.trial_squad_uuids or []),
+        trial_hwid_limit=row.trial_hwid_limit,
+        trial_traffic_gb=row.trial_traffic_gb,
+        node_alerts_enabled=row.node_alerts_enabled,
+        node_alerts_chat_id=row.node_alerts_chat_id,
+        purchase_notify_chat_id=row.purchase_notify_chat_id,
+        admin_telegram_ids=list(row.admin_telegram_ids or []),
+        privacy_policy_url=row.privacy_policy_url,
+        terms_url=row.terms_url,
+        menu_photo=row.menu_photo,
+        menu_photo_url=(
+            f"{settings.public_url}/uploads/{row.menu_photo}" if row.menu_photo else None
+        ),
+        allow_multiple_subscriptions=row.allow_multiple_subscriptions,
+        menu_hidden=list(row.menu_hidden or []),
+        menu_columns=row.menu_columns or 1,
+        menu_styles=dict(row.menu_styles or {}),
+        menu_mode=row.menu_mode or "keyboard",
+        menu_labels=dict(row.menu_labels or {}),
+        support_mode=row.support_mode or "link",
+        config_applied_at=row.config_applied_at,
+        discount_percent=row.discount_percent or 0,
+        discount_until=row.discount_until,
+    )
+
+
+@router.get("", response_model=BotStatusOut)
+async def get_status(admin: CurrentAdmin, db: DbSession) -> BotStatusOut:
+    return _status(await _config(db))
+
+
+# ── Прокси ────────────────────────────────────────────────────────────
+class ProxyIn(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    username: str | None = Field(default=None, max_length=255)
+    password: str | None = Field(default=None, max_length=255)
+
+    def url(self) -> str:
+        host = self.host.strip()
+        for prefix in ("socks5h://", "socks5://"):
+            host = host.removeprefix(prefix)
+        if not host or any(c in host for c in "/@ "):
+            raise ValueError("Адрес прокси указан неверно")
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"  # IPv6
+        auth = ""
+        if self.username:
+            auth = quote(self.username, safe="")
+            if self.password:
+                auth += ":" + quote(self.password, safe="")
+            auth += "@"
+        return f"socks5://{auth}{host}:{self.port}"
+
+
+def _proxy_masked(row: BotConfig) -> str | None:
+    if not row.proxy_encrypted:
+        return None
+    parts = urlsplit(decrypt(row.proxy_encrypted))
+    auth = "•••@" if parts.username else ""
+    return f"socks5://{auth}{parts.hostname}:{parts.port}"
+
+
+def _proxy_url(data: ProxyIn) -> str:
+    try:
+        return data.url()
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+
+class ProxyCheckOut(BaseModel):
+    ok: bool
+    message: str
+
+
+@router.post("/proxy/check", response_model=ProxyCheckOut)
+async def check_proxy(
+    data: ProxyIn, admin: CurrentAdmin, db: DbSession
+) -> ProxyCheckOut:
+    """Проверяет, достаёт ли прокси до Telegram, до сохранения."""
+    url = _proxy_url(data)
+    try:
+        await telegram.ping(proxy=url)
+    except TelegramError as exc:
+        return ProxyCheckOut(ok=False, message=str(exc))
+    return ProxyCheckOut(ok=True, message="Прокси работает — Telegram отвечает")
+
+
+@router.put("/proxy", response_model=BotStatusOut)
+async def set_proxy(
+    data: ProxyIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> BotStatusOut:
+    url = _proxy_url(data)
+    try:
+        await telegram.ping(proxy=url)
+    except TelegramError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    return await _save_proxy(db, admin, request, encrypt(url))
+
+
+@router.delete("/proxy", response_model=BotStatusOut)
+async def delete_proxy(
+    admin: CurrentAdmin, db: DbSession, request: Request
+) -> BotStatusOut:
+    return await _save_proxy(db, admin, request, None)
+
+
+async def _save_proxy(db, admin, request: Request, value: str | None) -> BotStatusOut:
+    row = await _config(db)
+    row.proxy_encrypted = value
+    _audit(db, admin, "bot.proxy", request, enabled=value is not None)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    if row.enabled:
+        await bus.publish(bus.CMD_START)  # перезапуск бота с новым прокси
+    return _status(row)
+
+
+# ── Токен ─────────────────────────────────────────────────────────────
+class TokenIn(BaseModel):
+    token: str = Field(min_length=10, max_length=256)
+
+
+class TokenCheckOut(BaseModel):
+    ok: bool
+    message: str
+    bot_username: str | None = None
+    bot_name: str | None = None
+
+
+@router.post("/token/check", response_model=TokenCheckOut)
+async def check_token(data: TokenIn, admin: CurrentAdmin) -> TokenCheckOut:
+    """Показывает, какому боту принадлежит токен, до его сохранения."""
+    try:
+        identity = await telegram.get_me(data.token.strip())
+    except TelegramError as exc:
+        return TokenCheckOut(ok=False, message=str(exc))
+    return TokenCheckOut(
+        ok=True,
+        message=f"Токен принадлежит боту @{identity.username}",
+        bot_username=identity.username,
+        bot_name=identity.name,
+    )
+
+
+@router.put("/token", response_model=BotStatusOut)
+async def set_token(
+    data: TokenIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> BotStatusOut:
+    """Сохраняет токен и переключает бота на него.
+
+    База пользователей не трогается: привязка идёт по telegram_id, поэтому
+    после смены бота клиенты остаются теми же.
+    """
+    token = data.token.strip()
+    try:
+        identity = await telegram.get_me(token)
+    except TelegramError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    row = await _config(db)
+    changed = row.bot_id is not None and row.bot_id != identity.id
+
+    row.token_encrypted = encrypt(token)
+    row.bot_id = identity.id
+    row.bot_username = identity.username
+    row.bot_name = identity.name
+    if changed:
+        # Другой бот — прежняя проверка Premium к нему не относится.
+        row.premium_available = False
+        row.premium_checked_at = None
+        if row.emoji_mode == EmojiMode.PREMIUM:
+            row.emoji_mode = EmojiMode.PLAIN
+
+    _audit(db, admin, "bot.token", request, bot=identity.username, changed=changed)
+    await db.flush()
+
+    if row.enabled:
+        await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+        await bus.publish(bus.CMD_START)
+    return _status(row)
+
+
+# ── Запуск и остановка ────────────────────────────────────────────────
+@router.post("/start", response_model=BotStatusOut)
+async def start_bot(
+    admin: CurrentAdmin, db: DbSession, request: Request
+) -> BotStatusOut:
+    row = await _config(db)
+    if not row.token_encrypted:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Сначала укажите токен бота из @BotFather"
+        )
+    row.enabled = True
+    _audit(db, admin, "bot.start", request)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_START)
+    return _status(row)
+
+
+@router.post("/stop", response_model=BotStatusOut)
+async def stop_bot(admin: CurrentAdmin, db: DbSession, request: Request) -> BotStatusOut:
+    row = await _config(db)
+    row.enabled = False
+    row.state = BotState.STOPPED
+    _audit(db, admin, "bot.stop", request)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_STOP)
+    return _status(row)
+
+
+# ── Настройки ─────────────────────────────────────────────────────────
+class BotSettingsIn(BaseModel):
+    welcome_text: str | None = Field(default=None, max_length=4000)
+    support_url: str | None = Field(default=None, max_length=255)
+    channel_url: str | None = Field(default=None, max_length=255)
+    channel_id: str | None = Field(default=None, max_length=64)
+    require_channel_sub: bool = False
+
+    trial_enabled: bool = True
+    trial_days: int = Field(default=3, ge=1, le=365)
+    trial_squad_uuids: list[str] = Field(default_factory=list)
+    trial_hwid_limit: int = Field(default=3, ge=1, le=100)
+    trial_traffic_gb: int = Field(default=0, ge=0, le=100000)
+
+    # Уведомление о каждой продаже в чат/группу (бот должен состоять в ней).
+    # Пусто/0 — уведомления отключены.
+    purchase_notify_chat_id: int | None = None
+
+    # Telegram ID, которым в самом боте открывается команда /admin.
+    admin_telegram_ids: list[int] = Field(default_factory=list)
+
+    # Кнопки в профиле бота — пусто, если ссылка не задана.
+    privacy_policy_url: str | None = Field(default=None, max_length=512)
+    terms_url: str | None = Field(default=None, max_length=512)
+
+    # Несколько ключей на клиента («Купить ещё одну») или одна подписка,
+    # которую «Купить» продлевает.
+    allow_multiple_subscriptions: bool = False
+    # Скрытые кнопки меню — ключи из MENU_BUTTONS (bot/app/keyboards.py).
+    menu_hidden: list[str] = Field(default_factory=list, max_length=32)
+    # Сколько кнопок главного меню в ряд.
+    menu_columns: int = Field(default=1, ge=1, le=3)
+    # Цвет кнопки: primary (синий), success (зелёный), danger (красный),
+    # none — без цвета. Других стилей Telegram не принимает вовсе.
+    menu_styles: dict[str, Literal["primary", "success", "danger", "none"]] = Field(
+        default_factory=dict
+    )
+    # Свои подписи кнопок (ключи — shared/botcopy.py BUTTONS); пустая —
+    # стандартная.
+    menu_labels: dict[str, str] = Field(default_factory=dict, max_length=64)
+    # keyboard — «Меню»/«Помощь» под полем ввода; commands — кнопка меню
+    # Telegram слева от поля (не перекрывает жест «назад»).
+    menu_mode: Literal["keyboard", "commands"] = "commands"
+
+    @field_validator("menu_labels")
+    @classmethod
+    def _labels(cls, value: dict[str, str]) -> dict[str, str]:
+        clean: dict[str, str] = {}
+        for key, text in value.items():
+            try:
+                checked = validate_button(key, text or "")
+            except CopyError as exc:
+                raise ValueError(str(exc)) from None
+            if checked is not None:
+                clean[key] = checked
+        return clean
+
+    @field_validator("support_url")
+    @classmethod
+    def _support_link(cls, value: str | None) -> str | None:
+        # @username → https://t.me/username: кнопке в боте нужен полный адрес.
+        return normalize_support_link(value)
+
+    @field_validator(
+        "channel_url", "channel_id", "welcome_text",
+        "privacy_policy_url", "terms_url",
+    )
+    @classmethod
+    def _blank_to_none(cls, value: str | None) -> str | None:
+        # Пустое поле в форме = «не задано»: иначе бот рисовал кнопку с
+        # пустой ссылкой и Telegram отклонял всё меню целиком.
+        return value.strip() or None if value is not None else None
+
+
+@router.put("/settings", response_model=BotStatusOut)
+async def save_settings(
+    data: BotSettingsIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> BotStatusOut:
+    row = await _config(db)
+    for field, value in data.model_dump().items():
+        setattr(row, field, value)
+    row.purchase_notify_chat_id = data.purchase_notify_chat_id or None
+    _audit(db, admin, "bot.settings", request)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return _status(row)
+
+
+# ── Картинка над экранами бота ────────────────────────────────────────
+MAX_PHOTO_BYTES = 5 * 1024 * 1024
+PHOTO_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+
+
+def _drop_photo_file(name: str | None) -> None:
+    """Старый файл больше не нужен: имена уникальные, ссылок на него нет."""
+    if not name:
+        return
+    try:
+        os.remove(os.path.join(settings.upload_dir, name))
+    except OSError:
+        pass
+
+
+@router.put("/menu-photo", response_model=BotStatusOut)
+async def set_menu_photo(
+    admin: CurrentAdmin, db: DbSession, request: Request, file: UploadFile
+) -> BotStatusOut:
+    """Загружает картинку, которая показывается над каждым экраном бота.
+
+    Файл кладётся в общий том `uploads`: бот берёт его с диска и не зависит
+    от того, доступен ли адрес панели снаружи.
+    """
+    ext = PHOTO_TYPES.get(file.content_type or "")
+    if ext is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Поддерживаются только JPEG, PNG и WebP",
+        )
+
+    body = await file.read(MAX_PHOTO_BYTES + 1)
+    if len(body) > MAX_PHOTO_BYTES:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Файл больше 5 МБ")
+
+    os.makedirs(settings.upload_dir, exist_ok=True)
+    name = f"menu-{uuid_lib.uuid4().hex}{ext}"
+    with open(os.path.join(settings.upload_dir, name), "wb") as f:
+        f.write(body)
+
+    row = await _config(db)
+    previous, row.menu_photo = row.menu_photo, name
+    _audit(db, admin, "bot.menu_photo.set", request)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    _drop_photo_file(previous)
+    await bus.publish(bus.CMD_RELOAD)
+    return _status(row)
+
+
+@router.delete("/menu-photo", response_model=BotStatusOut)
+async def delete_menu_photo(
+    admin: CurrentAdmin, db: DbSession, request: Request
+) -> BotStatusOut:
+    row = await _config(db)
+    previous, row.menu_photo = row.menu_photo, None
+    _audit(db, admin, "bot.menu_photo.delete", request)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    _drop_photo_file(previous)
+    await bus.publish(bus.CMD_RELOAD)
+    return _status(row)
+
+
+# ── Режим эмодзи ──────────────────────────────────────────────────────
+class EmojiModeIn(BaseModel):
+    mode: EmojiMode
+    # Свои id поверх встроенного набора (bot/app/icons.py). Пусто — оставить
+    # как есть: для включения премиума достаточно одной галочки в панели.
+    premium_emoji: dict[str, str] | None = None
+    # Куда слать проверочное сообщение. Пусто — первому администратору бота.
+    test_chat_id: int | None = None
+
+
+# Встроенная иконка «✅» из набора бота — ей проверяем, что премиум доступен.
+_SAMPLE_EMOJI_ID = "5774022692642492953"
+
+
+class EmojiModeOut(BaseModel):
+    ok: bool
+    message: str
+    status: BotStatusOut
+
+
+@router.put("/emoji", response_model=EmojiModeOut)
+async def set_emoji_mode(
+    data: EmojiModeIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> EmojiModeOut:
+    """Переключает набор эмодзи.
+
+    Премиум-режим включается только после успешной проверки: панель шлёт
+    тестовое сообщение с кастомным эмодзи. Если у аккаунта, создавшего
+    бота, нет Telegram Premium, Telegram откажет — и мы честно об этом
+    скажем, оставив обычный режим.
+    """
+    row = await _config(db)
+
+    if data.premium_emoji is not None:
+        row.premium_emoji = data.premium_emoji
+
+    if data.mode is EmojiMode.PLAIN:
+        row.emoji_mode = EmojiMode.PLAIN
+        _audit(db, admin, "bot.emoji", request, mode="plain")
+        await db.flush()
+        await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+        await bus.publish(bus.CMD_RELOAD)
+        return EmojiModeOut(
+            ok=True, message="Включены обычные эмодзи", status=_status(row)
+        )
+
+    if not row.token_encrypted:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Сначала укажите токен бота"
+        )
+    test_chat_id = data.test_chat_id or next(iter(row.admin_telegram_ids or []), None)
+    if not test_chat_id:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Укажите свой Telegram ID в «Бот → Уведомления и админы» и напишите боту /start — "
+            "туда придёт проверочное сообщение",
+        )
+
+    token = decrypt(row.token_encrypted)
+    try:
+        await telegram.check_premium_emoji(token, test_chat_id, _SAMPLE_EMOJI_ID)
+    except TelegramError as exc:
+        was_premium = row.emoji_mode == EmojiMode.PREMIUM
+        row.premium_available = False
+        row.premium_checked_at = datetime.now(UTC)
+        row.emoji_mode = EmojiMode.PLAIN
+        await db.flush()
+        if was_premium:
+            # Режим сменился — бот должен перечитать конфиг, иначе продолжит
+            # слать премиум-эмодзи, которые у клиентов уже не рисуются.
+            await db.commit()
+            await bus.publish(bus.CMD_RELOAD)
+        return EmojiModeOut(
+            ok=False,
+            message=(
+                f"Премиум-эмодзи включить не удалось: {exc}. "
+                "Проверьте, что у аккаунта, на котором бот создан в @BotFather, "
+                "активен Telegram Premium, и что вы начали диалог с ботом."
+            ),
+            status=_status(row),
+        )
+
+    row.emoji_mode = EmojiMode.PREMIUM
+    row.premium_available = True
+    row.premium_checked_at = datetime.now(UTC)
+    _audit(db, admin, "bot.emoji", request, mode="premium")
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return EmojiModeOut(
+        ok=True, message="Премиум-эмодзи включены", status=_status(row)
+    )
+
+
+# ── Тарифы ────────────────────────────────────────────────────────────
+class PlanIn(BaseModel):
+    title: str = Field(min_length=1, max_length=64)
+    days: int = Field(ge=1, le=3650)
+    # Не меньше 1 ₽: бесплатный тариф бот всё равно не продаст (счёт на 0 ₽
+    # не примет ни одна платёжка), и в меню он висел бы «недоступным».
+    price_rub: float = Field(ge=1, le=1_000_000)
+    squad_uuids: list[str] = Field(default_factory=list)
+    hwid_limit: int = Field(default=3, ge=1, le=100)
+    traffic_limit_bytes: int = Field(default=0, ge=0)
+    category_id: int | None = None
+    is_active: bool = True
+    sort_order: int = 0
+
+
+class PlanOut(PlanIn):
+    id: int
+    # Без ограничения из PlanIn: старые тарифы с ценой 0 должны читаться.
+    price_rub: float
+
+
+def _plan_out(plan: Plan) -> PlanOut:
+    return PlanOut(
+        id=plan.id,
+        title=plan.title,
+        days=plan.days,
+        price_rub=plan.price_kopeks / 100,
+        squad_uuids=list(plan.squad_uuids or []),
+        hwid_limit=plan.hwid_limit,
+        traffic_limit_bytes=plan.traffic_limit_bytes,
+        category_id=plan.category_id,
+        is_active=plan.is_active,
+        sort_order=plan.sort_order,
+    )
+
+
+# ── Категории тарифов ────────────────────────────────────────────────
+class PlanCategoryIn(BaseModel):
+    title: str = Field(min_length=1, max_length=64)
+    sort_order: int = 0
+
+
+class PlanCategoryOut(PlanCategoryIn):
+    id: int
+
+
+@router.get("/plan-categories", response_model=list[PlanCategoryOut])
+async def list_plan_categories(
+    admin: CurrentAdmin, db: DbSession
+) -> list[PlanCategoryOut]:
+    rows = await db.scalars(
+        select(PlanCategory).order_by(PlanCategory.sort_order, PlanCategory.title)
+    )
+    return [PlanCategoryOut(id=r.id, title=r.title, sort_order=r.sort_order) for r in rows]
+
+
+@router.post(
+    "/plan-categories",
+    response_model=PlanCategoryOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_plan_category(
+    data: PlanCategoryIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> PlanCategoryOut:
+    row = PlanCategory(title=data.title, sort_order=data.sort_order)
+    db.add(row)
+    _audit(db, admin, "bot.plan_category.create", request, title=data.title)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return PlanCategoryOut(id=row.id, title=row.title, sort_order=row.sort_order)
+
+
+@router.put("/plan-categories/{category_id}", response_model=PlanCategoryOut)
+async def update_plan_category(
+    category_id: int,
+    data: PlanCategoryIn,
+    admin: CurrentAdmin,
+    db: DbSession,
+    request: Request,
+) -> PlanCategoryOut:
+    row = await db.get(PlanCategory, category_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Категория не найдена")
+    row.title = data.title
+    row.sort_order = data.sort_order
+    _audit(db, admin, "bot.plan_category.update", request, category_id=category_id)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return PlanCategoryOut(id=row.id, title=row.title, sort_order=row.sort_order)
+
+
+@router.delete("/plan-categories/{category_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_plan_category(
+    category_id: int, admin: CurrentAdmin, db: DbSession, request: Request
+) -> None:
+    """Удаляет категорию. Тарифы в ней не удаляются — просто становятся без
+    категории (ON DELETE SET NULL), чтобы случайное удаление вкладки не
+    стёрло тарифы, которыми уже кто-то пользуется."""
+    result = await db.execute(delete(PlanCategory).where(PlanCategory.id == category_id))
+    if result.rowcount == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Категория не найдена")
+    _audit(db, admin, "bot.plan_category.delete", request, category_id=category_id)
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+
+
+@router.get("/plans", response_model=list[PlanOut])
+async def list_plans(admin: CurrentAdmin, db: DbSession) -> list[PlanOut]:
+    # Персональные тарифы живут в карточке клиента (Клиенты бота).
+    plans = await db.scalars(
+        select(Plan).where(Plan.owner_user_id.is_(None)).order_by(Plan.sort_order, Plan.days)
+    )
+    return [_plan_out(p) for p in plans]
+
+
+@router.post("/plans", response_model=PlanOut, status_code=status.HTTP_201_CREATED)
+async def create_plan(
+    data: PlanIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> PlanOut:
+    plan = Plan(
+        title=data.title,
+        days=data.days,
+        # Цены в копейках: float в деньгах рано или поздно теряет копейку.
+        price_kopeks=round(data.price_rub * 100),
+        squad_uuids=data.squad_uuids,
+        hwid_limit=data.hwid_limit,
+        traffic_limit_bytes=data.traffic_limit_bytes,
+        category_id=data.category_id,
+        is_active=data.is_active,
+        sort_order=data.sort_order,
+    )
+    db.add(plan)
+    _audit(db, admin, "bot.plan.create", request, title=data.title)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return _plan_out(plan)
+
+
+@router.put("/plans/{plan_id}", response_model=PlanOut)
+async def update_plan(
+    plan_id: int,
+    data: PlanIn,
+    admin: CurrentAdmin,
+    db: DbSession,
+    request: Request,
+) -> PlanOut:
+    plan = await db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Тариф не найден")
+
+    plan.title = data.title
+    plan.days = data.days
+    plan.price_kopeks = round(data.price_rub * 100)
+    plan.squad_uuids = data.squad_uuids
+    plan.hwid_limit = data.hwid_limit
+    plan.traffic_limit_bytes = data.traffic_limit_bytes
+    plan.category_id = data.category_id
+    plan.is_active = data.is_active
+    plan.sort_order = data.sort_order
+
+    _audit(db, admin, "bot.plan.update", request, plan_id=plan_id)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return _plan_out(plan)
+
+
+@router.delete("/plans/{plan_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_plan(
+    plan_id: int, admin: CurrentAdmin, db: DbSession, request: Request
+) -> None:
+    await ensure_no_open_payments(db, Payment.plan_id == plan_id, "тарифу")
+    result = await db.execute(delete(Plan).where(Plan.id == plan_id))
+    if result.rowcount == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Тариф не найден")
+    _audit(db, admin, "bot.plan.delete", request, plan_id=plan_id)
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+
+
+# ── Пакеты докупаемого трафика ────────────────────────────────────────
+class TrafficPackageIn(BaseModel):
+    title: str = Field(min_length=1, max_length=64)
+    traffic_gb: int = Field(ge=1, le=100_000)
+    price_rub: float = Field(ge=1, le=1_000_000)
+    is_active: bool = True
+    sort_order: int = 0
+
+
+class TrafficPackageOut(TrafficPackageIn):
+    id: int
+    price_rub: float
+
+
+def _package_out(row: TrafficPackage) -> TrafficPackageOut:
+    return TrafficPackageOut(
+        id=row.id,
+        title=row.title,
+        traffic_gb=row.traffic_gb,
+        price_rub=row.price_kopeks / 100,
+        is_active=row.is_active,
+        sort_order=row.sort_order,
+    )
+
+
+@router.get("/traffic-packages", response_model=list[TrafficPackageOut])
+async def list_traffic_packages(admin: CurrentAdmin, db: DbSession) -> list[TrafficPackageOut]:
+    rows = await db.scalars(
+        select(TrafficPackage).order_by(TrafficPackage.sort_order, TrafficPackage.traffic_gb)
+    )
+    return [_package_out(r) for r in rows]
+
+
+@router.post(
+    "/traffic-packages", response_model=TrafficPackageOut, status_code=status.HTTP_201_CREATED
+)
+async def create_traffic_package(
+    data: TrafficPackageIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> TrafficPackageOut:
+    row = TrafficPackage(
+        title=data.title,
+        traffic_gb=data.traffic_gb,
+        # Цены в копейках: float в деньгах рано или поздно теряет копейку.
+        price_kopeks=round(data.price_rub * 100),
+        is_active=data.is_active,
+        sort_order=data.sort_order,
+    )
+    db.add(row)
+    _audit(db, admin, "bot.traffic_package.create", request, title=data.title)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return _package_out(row)
+
+
+@router.put("/traffic-packages/{package_id}", response_model=TrafficPackageOut)
+async def update_traffic_package(
+    package_id: int,
+    data: TrafficPackageIn,
+    admin: CurrentAdmin,
+    db: DbSession,
+    request: Request,
+) -> TrafficPackageOut:
+    row = await db.get(TrafficPackage, package_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Пакет не найден")
+    row.title = data.title
+    row.traffic_gb = data.traffic_gb
+    row.price_kopeks = round(data.price_rub * 100)
+    row.is_active = data.is_active
+    row.sort_order = data.sort_order
+    _audit(db, admin, "bot.traffic_package.update", request, package_id=package_id)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return _package_out(row)
+
+
+@router.delete("/traffic-packages/{package_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_traffic_package(
+    package_id: int, admin: CurrentAdmin, db: DbSession, request: Request
+) -> None:
+    await ensure_no_open_payments(db, Payment.traffic_package_id == package_id, "пакету")
+    result = await db.execute(delete(TrafficPackage).where(TrafficPackage.id == package_id))
+    if result.rowcount == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Пакет не найден")
+    _audit(db, admin, "bot.traffic_package.delete", request, package_id=package_id)
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+
+
+# ── Сквады для выпадающих списков ─────────────────────────────────────
+@router.get("/squads")
+async def list_squads(admin: CurrentAdmin, db: DbSession) -> list[dict]:
+    """Сквады Remnawave — чтобы тариф выбирался списком, а не вводом UUID."""
+    from app.services.remnawave_provider import get_client
+
+    client = await get_client(db)
+    squads = await client.get_internal_squads()
+    return [
+        {"uuid": s.get("uuid"), "name": s.get("name")}
+        for s in squads
+        if s.get("uuid")
+    ]
+
+
+# ── Алерты о падении нод (Pro) ─────────────────────────────────────────
+class NodeAlertsIn(BaseModel):
+    enabled: bool
+    chat_id: int | None = None
+
+
+@router.put("/node-alerts", response_model=BotStatusOut)
+async def save_node_alerts(
+    data: NodeAlertsIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> BotStatusOut:
+    row = await _config(db)
+    row.node_alerts_enabled = data.enabled
+    row.node_alerts_chat_id = data.chat_id
+    _audit(db, admin, "bot.node_alerts", request)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return _status(row)
+
+
+# ── Общая скидка ──────────────────────────────────────────────────────
+class DiscountIn(BaseModel):
+    percent: int = Field(ge=0, le=95)
+    # Сколько дней действует скидка с момента сохранения. Пусто — бессрочно,
+    # до ручного отключения.
+    days: int | None = Field(default=None, ge=1, le=3650)
+
+
+@router.put("/discount", response_model=BotStatusOut)
+async def save_discount(
+    data: DiscountIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> BotStatusOut:
+    row = await _config(db)
+    row.discount_percent = data.percent
+    row.discount_until = (
+        datetime.now(UTC) + timedelta(days=data.days) if data.percent and data.days else None
+    )
+    _audit(db, admin, "bot.discount", request, percent=data.percent, days=data.days)
+    await db.flush()
+    await db.commit()  # видно другим сессиям ДО pub/sub-уведомления бота
+    await bus.publish(bus.CMD_RELOAD)
+    return _status(row)
+
+
+# ── Чат уведомлений о продажах ────────────────────────────────────────
+class NotifyChatIn(BaseModel):
+    # -1001234567890 или @publicgroup — публичное имя переводим в id.
+    chat: str = Field(min_length=1, max_length=64)
+
+
+class NotifyChatOut(BaseModel):
+    ok: bool
+    message: str
+    chat_id: int | None = None
+
+
+@router.post("/notify-chat/test", response_model=NotifyChatOut)
+async def test_notify_chat(
+    data: NotifyChatIn, admin: CurrentAdmin, db: DbSession
+) -> NotifyChatOut:
+    """Шлёт в чат проверочное сообщение и объясняет ошибку Telegram.
+
+    Уведомления о продажах уходят молча: если бот не в группе или id указан
+    без «-100», админ раньше просто ничего не получал и не понимал почему.
+    """
+    row = await _config(db)
+    if not row.token_encrypted:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Сначала укажите токен бота")
+    token = decrypt(row.token_encrypted)
+    try:
+        chat_id = await telegram.send_test_to_chat(token, data.chat.strip())
+    except TelegramError as exc:
+        return NotifyChatOut(ok=False, message=telegram.explain_chat_error(str(exc)))
+    return NotifyChatOut(
+        ok=True, message="Тестовое сообщение отправлено — проверьте чат", chat_id=chat_id
+    )

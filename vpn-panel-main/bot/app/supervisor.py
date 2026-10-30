@@ -1,0 +1,392 @@
+"""Запуск, остановка и перезапуск бота по командам из панели.
+
+Контейнер живёт всегда; сам бот — задача внутри него. Панель шлёт команду
+через Redis, супервизор поднимает или гасит polling. Поэтому смена токена
+и правка цен не требуют `docker compose restart`.
+"""
+
+import asyncio
+import logging
+import os
+from datetime import UTC, datetime
+
+from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.fsm.storage.redis import RedisStorage
+
+from app import config as config_module
+from app import premium, telegram_client
+from app.support.runner import SupportRunner
+from shared import bus
+from shared.db.models import BotConfig, BotState
+from shared.db.session import session
+
+log = logging.getLogger("bot.supervisor")
+
+# Как часто бот сверяет настройки с базой сам, не дожидаясь команды панели.
+# Команда идёт через Redis без повторов: оборвалось соединение (сон ноутбука,
+# сеть) — и «перечитай настройки» терялась молча, бот жил со старыми до
+# перезапуска. Теперь потерянная команда догоняется за несколько секунд.
+CONFIG_WATCH_INTERVAL = 10
+
+# Через сколько пробовать снова, если старт или polling упали не из-за
+# токена (сеть, Telegram 5xx). Без этого бот после перезагрузки сервера с
+# медленной сетью висел бы в «ошибке» до ручного нажатия в панели.
+RETRY_DELAYS = (15, 30, 60, 120, 300)
+
+
+class Supervisor:
+    def __init__(self) -> None:
+        self._task: asyncio.Task | None = None
+        self._workers: list[asyncio.Task] = []
+        self._bot: Bot | None = None
+        self._dispatcher: Dispatcher | None = None
+        self._storage: RedisStorage | None = None
+        self._config: config_module.Config | None = None
+        self._lock = asyncio.Lock()
+        self._retry_task: asyncio.Task | None = None
+        self._failures = 0
+        self._support = SupportRunner()
+        # Последние настройки, которые мы уже обработали (применили или
+        # попытались): с ними сравнивает сверка с базой.
+        self._last_seen: config_module.Config | None = None
+        self._watcher: asyncio.Task | None = None
+
+    # ── Состояние в БД ────────────────────────────────────────────────
+    async def _set_state(
+        self, state: BotState, message: str | None = None, **fields: object
+    ) -> None:
+        """Панель показывает это состояние на вкладке «Бот»."""
+        async with session() as db:
+            row = await db.get(BotConfig, 1)
+            if row is None:
+                return
+            row.state = state
+            row.state_message = message
+            if state is BotState.RUNNING:
+                row.started_at = datetime.now(UTC)
+            for key, value in fields.items():
+                setattr(row, key, value)
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    # ── Жизненный цикл ────────────────────────────────────────────────
+    async def start(self) -> None:
+        async with self._lock:
+            await self._start_locked()
+
+    async def _start_locked(self) -> None:
+        self._cancel_retry()
+        await self._stop_locked()
+
+        async with session() as db:
+            config = await config_module.load(db)
+        self._last_seen = config
+        premium.set_enabled(config.premium)
+
+        await self._apply_support(config)
+        if not config.can_run:
+            log.info("Бот выключен или без токена — жду команды из панели")
+            await self._set_state(BotState.STOPPED)
+            return
+
+        telegram_client.set_proxy(config.proxy)
+        bot = telegram_client.make_bot(config.token)
+        try:
+            me = await bot.get_me()
+        except TelegramUnauthorizedError:
+            await bot.session.close()
+            log.error("Telegram отверг токен")
+            await self._set_state(
+                BotState.ERROR,
+                "Telegram отверг токен. Проверьте его в @BotFather и вставьте заново.",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            await bot.session.close()
+            log.exception("Не удалось запустить бота")
+            await self._set_state(
+                BotState.ERROR, f"Не удалось запустить: {exc}. Повторю попытку автоматически."
+            )
+            self._schedule_retry()
+            return
+
+        from app.handlers import build_dispatcher
+
+        storage = RedisStorage.from_url(os.environ.get("REDIS_URL", "redis://redis:6379/0"))
+        dispatcher = build_dispatcher(storage=storage, config=config)
+
+        from app.workers.auto_renewal import worker as auto_renewal_worker
+        from app.workers.broadcast import worker as broadcast_worker
+        from app.workers.expiry import worker as expiry_worker
+        from app.workers.node_alerts import worker as node_alerts_worker
+        from app.workers.panel_sync import worker as panel_sync_worker
+        from app.workers.payment_polling import worker as payment_polling_worker
+        from app.workers.payments import worker as payments_worker
+
+        self._bot = bot
+        self._dispatcher = dispatcher
+        self._storage = storage
+        self._config = config
+        self._failures = 0
+        self._task = asyncio.create_task(self._run(bot, dispatcher))
+        self._workers = [
+            asyncio.create_task(expiry_worker(bot)),
+            asyncio.create_task(payments_worker()),
+            asyncio.create_task(payment_polling_worker()),
+            asyncio.create_task(auto_renewal_worker()),
+            asyncio.create_task(broadcast_worker(config.token)),
+            asyncio.create_task(node_alerts_worker()),
+            asyncio.create_task(panel_sync_worker()),
+        ]
+
+        await self._apply_menu_button(bot, config)
+
+        await self._set_state(
+            BotState.RUNNING,
+            None,
+            bot_username=me.username,
+            bot_name=me.full_name,
+            bot_id=me.id,
+        )
+        log.info("Бот @%s запущен", me.username)
+
+    @staticmethod
+    async def _apply_menu_button(bot: Bot, config: config_module.Config) -> None:
+        """Кнопка меню Telegram слева от поля ввода — со списком команд
+        «Главное меню» и «Помощь». В обычном режиме убираем её, чтобы не
+        дублировала клавиатуру под полем ввода. Сбой здесь не мешает боту
+        работать — это только оформление."""
+        from aiogram.types import BotCommand, MenuButtonCommands, MenuButtonDefault
+
+        try:
+            if config.menu_mode == "commands":
+                commands = [BotCommand(command="menu", description="Главное меню")]
+                if config.shows("help"):
+                    commands.append(BotCommand(command="help", description="Помощь"))
+                await bot.set_my_commands(commands)
+                await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+            else:
+                await bot.delete_my_commands()
+                await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось настроить кнопку меню: %s", exc)
+
+    async def _run(self, bot: Bot, dispatcher: Dispatcher) -> None:
+        try:
+            # Токен мог раньше работать на другом боте через webhook (так
+            # устроен, например, Bedolaga) — пока webhook стоит, Telegram
+            # отказывает в getUpdates, и бот «запущен», но молчит. Заодно
+            # пропускаем накопленное за время простоя: старые нажатия кнопок
+            # уже неактуальны. У start_polling в aiogram 3 такого параметра
+            # нет — переданный туда drop_pending_updates молча игнорировался.
+            await bot.delete_webhook(drop_pending_updates=True)
+            # Копим только нужные типы обновлений.
+            await dispatcher.start_polling(
+                bot,
+                handle_signals=False,
+                allowed_updates=["message", "callback_query", "my_chat_member", "pre_checkout_query"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Polling упал")
+            await self._set_state(
+                BotState.ERROR, f"Бот остановился: {exc}. Повторю попытку автоматически."
+            )
+            self._schedule_retry()
+
+    def _schedule_retry(self) -> None:
+        if self._retry_task is not None and not self._retry_task.done():
+            return
+        delay = RETRY_DELAYS[min(self._failures, len(RETRY_DELAYS) - 1)]
+        self._failures += 1
+
+        async def _retry() -> None:
+            await asyncio.sleep(delay)
+            log.info("Повторная попытка запуска бота")
+            await self.start()
+
+        self._retry_task = asyncio.create_task(_retry())
+
+    def _cancel_retry(self) -> None:
+        if self._retry_task is not None and not self._retry_task.done():
+            if self._retry_task is not asyncio.current_task():
+                self._retry_task.cancel()
+        self._retry_task = None
+
+    async def _mark_applied(self) -> None:
+        """Отметка в базе: панель по ней показывает, что бот настройки получил."""
+        try:
+            async with session() as db:
+                row = await db.get(BotConfig, 1)
+                if row is not None:
+                    row.config_applied_at = datetime.now(UTC)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось отметить применение настроек")
+
+    async def watch_config(self) -> None:
+        """Подстраховка к командам панели: раз в несколько секунд сверяем
+        настройки в базе с теми, что бот уже обработал, и применяем разницу."""
+        while True:
+            await asyncio.sleep(CONFIG_WATCH_INTERVAL)
+            try:
+                async with session() as db:
+                    fresh = await config_module.load(db)
+                if self._last_seen is not None and fresh != self._last_seen:
+                    log.info("Настройки в базе изменились, команда не пришла — применяю")
+                    await self.reload()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("Сверка настроек с базой не удалась")
+
+    async def _apply_support(self, config: config_module.Config) -> None:
+        """Бот поддержки живёт своей жизнью: сбой в нём не должен ронять
+        бота продаж, а остановка продаж — гасить поддержку."""
+        try:
+            await self._support.apply(config)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось применить настройки бота поддержки")
+
+    async def shutdown(self) -> None:
+        """Полная остановка процесса: и бот продаж, и бот поддержки."""
+        if self._watcher is not None:
+            self._watcher.cancel()
+        await self.stop()
+        await self._support.stop()
+
+    async def stop(self) -> None:
+        async with self._lock:
+            self._cancel_retry()
+            self._failures = 0
+            await self._stop_locked()
+            await self._set_state(BotState.STOPPED)
+
+    async def _stop_locked(self) -> None:
+        for task in self._workers:
+            task.cancel()
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+            self._workers = []
+        if self._dispatcher is not None:
+            await self._dispatcher.stop_polling()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):  # noqa: B014
+                pass
+            self._task = None
+        if self._bot is not None:
+            await self._bot.session.close()
+            self._bot = None
+        if self._storage is not None:
+            try:
+                await self._storage.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._storage = None
+        self._dispatcher = None
+        self._config = None
+
+    async def reload(self) -> None:
+        """Тарифы, тексты или платёжки изменились — перечитываем конфиг.
+
+        Если токен не сменился и бот работает, конфиг подменяется «на лету»
+        в контексте диспетчера: хендлеры получают его аргументом на каждый
+        апдейт, а воркеры перечитывают из БД сами. Полный перезапуск
+        поллинга оставлен только для смены токена или включения после
+        остановки — он ронял бы нажатия пользователей за время рестарта и
+        ловил «Conflict: terminated by other getUpdates request».
+        """
+        async with self._lock:
+            async with session() as db:
+                config = await config_module.load(db)
+            self._last_seen = config
+            premium.set_enabled(config.premium)
+
+            await self._apply_support(config)
+            if (
+                self.running
+                and self._dispatcher is not None
+                and self._config is not None
+                and config.can_run
+                and config.token == self._config.token
+            ):
+                previous = self._config
+                self._dispatcher["config"] = config
+                self._config = config
+                if self._bot is not None and (
+                    previous.menu_mode != config.menu_mode
+                    or previous.shows("help") != config.shows("help")
+                ):
+                    await self._apply_menu_button(self._bot, config)
+                log.info("Конфиг обновлён без перезапуска")
+                await self._mark_applied()
+                return
+
+            await self._start_locked()
+            await self._mark_applied()
+
+    # ── Приём команд ──────────────────────────────────────────────────
+    async def serve(self) -> None:
+        await self.start()  # вдруг бот уже включён в панели с прошлого раза
+        await self._mark_applied()
+        self._watcher = asyncio.create_task(self.watch_config())
+        # Догоняем платежи, подтверждённые, пока контейнер был выключен —
+        # их pub-sub уведомления пропали вместе с недоступным подписчиком.
+        await self._catch_up_payments()
+
+        # Обрыв связи с Redis (рестарт контейнера, сеть) завершает подписку
+        # исключением. Раньше на этом цикл команд умирал насовсем: бот
+        # продолжал polling, но не слышал панель до перезапуска контейнера.
+        delay = 1
+        while True:
+            try:
+                async for message in bus.listen():
+                    delay = 1
+                    await self._handle_command(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Потеряна связь с Redis (%s), переподключаюсь через %s с", exc, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
+            # Пока подписки не было, события оплат могли пропасть.
+            await self._catch_up_payments()
+
+    async def _handle_command(self, message: dict) -> None:
+        command = message.get("command")
+        log.info("Команда из панели: %s", command)
+        try:
+            if command == bus.CMD_START:
+                await self.start()
+            elif command == bus.CMD_STOP:
+                await self.stop()
+            elif command == bus.CMD_RELOAD:
+                await self.reload()
+            elif command == bus.EVENT_PAYMENT_COMPLETED:
+                # Обрабатывается независимо от self._task: доступ клиента
+                # к VPN не должен ждать, пока админ снова включит бота.
+                from app.services.payment_processor import handle
+
+                await handle(message["payment_id"])
+            elif command == bus.EVENT_BROADCAST_READY:
+                # Только будим воркер: отправка здесь, в цикле команд,
+                # блокировала шину на всё время рассылки.
+                from app.workers.broadcast import wakeup
+
+                wakeup.set()
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка при обработке команды %s", command)
+
+    async def _catch_up_payments(self) -> None:
+        from app.workers.payments import run_once
+
+        try:
+            await run_once()
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось дообработать отложенные оплаты при старте")

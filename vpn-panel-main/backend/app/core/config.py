@@ -1,0 +1,80 @@
+from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Настройки процесса — только инфраструктура.
+
+    Всё, что пользователь меняет в работе (Remnawave, бот, цены, платёжки),
+    живёт в БД и правится через панель, а не через .env.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    deploy_mode: Literal["domain", "ip"] = "ip"
+    panel_domain: str = ""
+    panel_port: int = 4250
+    # Публичный адрес сервера в режиме ip — записывается install.sh при
+    # установке. Без него ссылки на фото рассылок собирались бы на
+    # "localhost", который для серверов Telegram означает их же собственную
+    # машину — фото просто не скачивалось бы.
+    panel_public_url: str = ""
+    # Секретный путь панели: если задан, панель открывается только по
+    # адресу https://host/<путь> (дальше браузер помнит cookie), а на всё
+    # остальное сервер отвечает пустым 404 — сканеры не видят ни страницы
+    # входа, ни того, что здесь вообще есть панель. Пусто — выключено.
+    panel_secret_path: str = ""
+
+    database_url: str
+    redis_url: str = "redis://redis:6379/0"
+
+    secret_key: str
+    encryption_key: str
+    access_token_ttl_minutes: int = 60
+    refresh_token_ttl_days: int = 14
+
+    # Защита от перебора пароля: столько неудачных входов с одного IP за
+    # окно — и дальше 429 до конца окна.
+    login_max_failures: int = 10
+    login_window_minutes: int = 15
+
+    tz: str = "Europe/Moscow"
+    log_level: str = "INFO"
+
+    backup_dir: str = "/app/backups"
+    upload_dir: str = "/app/uploads"
+    openapi_spec_path: str = Field(
+        default="/app/shared/openapi/remnawave-2.8.1.json",
+        description="Спека Remnawave, по которой сгенерирован клиент.",
+    )
+
+    @property
+    def secret_path(self) -> str:
+        return self.panel_secret_path.strip().strip("/")
+
+    @property
+    def https_enabled(self) -> bool:
+        """В режиме ip трафик идёт по HTTP — cookie нельзя помечать Secure."""
+        return self.deploy_mode == "domain"
+
+    @property
+    def public_url(self) -> str:
+        if self.panel_public_url:
+            return self.panel_public_url.rstrip("/")
+        if self.deploy_mode == "domain":
+            return f"https://{self.panel_domain}"
+        # Резервный вариант для старых установок без PANEL_PUBLIC_URL в
+        # .env — сгенерированная ссылка на фото не будет работать, пока
+        # его не пропишут (см. update.sh, который делает это сам).
+        return f"http://localhost:{self.panel_port}"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()  # type: ignore[call-arg]
+
+
+settings = get_settings()

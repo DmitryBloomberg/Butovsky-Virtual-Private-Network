@@ -1,0 +1,371 @@
+"""Общая скидка, персональные тарифы, «Купить»/«Продлить», скрываемые кнопки,
+уведомления о продажах."""
+
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+from sqlalchemy import select
+
+from app import handlers, keyboards
+from app.services import pricing
+from app.services import subscriptions as subs
+from shared.db.models import Plan, Wallet
+from tests.test_fixes import PLAN, config, db, engine, remote  # noqa: F401  — фикстуры
+
+PERSONAL = replace(PLAN, id=50, title="VIP", price_kopeks=10000, owner_user_id=1)
+
+
+def _buttons(markup):
+    return [b for row in markup.inline_keyboard for b in row]
+
+
+def _callbacks(markup) -> list[str]:
+    return [b.callback_data for b in _buttons(markup) if b.callback_data]
+
+
+# ── Скидки ────────────────────────────────────────────────────────────
+def test_global_discount_until_date(config) -> None:
+    cfg = replace(config, discount_percent=25, discount_until=datetime.now(UTC) + timedelta(days=1))
+    assert cfg.global_discount() == 25
+    assert cfg.plan_discount(PLAN) == 25
+    expired = replace(cfg, discount_until=datetime.now(UTC) - timedelta(minutes=1))
+    assert expired.global_discount() == 0
+
+
+def test_personal_plan_ignores_global_discount(config) -> None:
+    cfg = replace(config, discount_percent=50)
+    assert cfg.plan_discount(PERSONAL) == 0
+    # Промокод действует и на персональный тариф.
+    assert cfg.plan_discount(PERSONAL, 10) == 10
+
+
+def test_discounts_do_not_stack(config) -> None:
+    cfg = replace(config, discount_percent=20)
+    assert cfg.plan_discount(PLAN, 10) == 20
+    assert cfg.plan_discount(PLAN, 40) == 40
+
+
+def test_plan_button_shows_price_in_words(config) -> None:
+    cfg = replace(config, discount_percent=15, plans=[replace(PLAN, price_kopeks=19900)])
+    button = _buttons(keyboards.plans_menu(cfg))[0]
+    # Без кривых комбинируемых символов и копеек: «169 ₽ вместо 199 ₽».
+    assert button.text == "Месяц • 169 ₽ вместо 199 ₽"
+
+
+# ── Персональные тарифы ───────────────────────────────────────────────
+async def test_personal_plan_visible_only_to_owner(db, config) -> None:
+    owner = await subs.get_or_create_user(db, 1)
+    other = await subs.get_or_create_user(db, 2)
+    await db.flush()
+    row = Plan(title="VIP", days=90, price_kopeks=5000, owner_user_id=owner.id)
+    db.add(row)
+    await db.flush()
+    cfg = replace(config, plans=[replace(PLAN, id=row.id + 100)])
+
+    assert [p.id for p in await pricing.personal_plans(db, owner)] == [row.id]
+    assert await pricing.personal_plans(db, other) == []
+    assert await pricing.find_plan(db, cfg, other, row.id) is None
+    found = await pricing.find_plan(db, cfg, owner, row.id)
+    assert found is not None and found.is_personal
+
+
+def test_personal_plans_on_top_of_list(config) -> None:
+    markup = keyboards.plans_menu(config, personal=[PERSONAL])
+    first = _buttons(markup)[0]
+    assert first.text.startswith("⭐ VIP") and first.callback_data == "buy:50"
+
+
+# ── Главное меню ──────────────────────────────────────────────────────
+def _menu(config, has_subscription: bool = False):
+    return keyboards.main_menu(
+        config, trial_available=False, has_subscription=has_subscription, balance_kopeks=0
+    )
+
+
+def test_menu_buy_without_subscription(config) -> None:
+    callbacks = _callbacks(_menu(config))
+    assert "plans" in callbacks and "renew" not in callbacks
+
+
+def test_menu_renew_with_subscription(config) -> None:
+    callbacks = _callbacks(_menu(config, has_subscription=True))
+    assert "renew" in callbacks
+    assert "plans" not in callbacks and "plans_new" not in callbacks
+    multi = replace(config, allow_multiple_subscriptions=True)
+    assert "plans_new" in _callbacks(_menu(multi, has_subscription=True))
+
+
+def test_menu_buttons_can_be_hidden(config) -> None:
+    cfg = replace(
+        config,
+        support_url="https://t.me/support",
+        menu_hidden=frozenset({"support", "promo", "profile", "balance"}),
+    )
+    texts = [b.text for b in _buttons(_menu(cfg))]
+    assert not any(t.startswith(("Поддержка", "Промокод", "Личный", "Баланс")) for t in texts)
+    assert all(row for row in _menu(cfg).inline_keyboard)  # без пустых рядов
+
+
+def test_help_button_can_be_hidden(config) -> None:
+    shown = [b.text for row in keyboards.reply_menu(config).keyboard for b in row]
+    assert shown == ["Меню", "Помощь"]
+    hidden = replace(config, menu_hidden=frozenset({"help"}))
+    assert [b.text for row in keyboards.reply_menu(hidden).keyboard for b in row] == ["Меню"]
+
+
+# ── Покупка при уже существующей подписке ─────────────────────────────
+async def _user_with_key(db, config):
+    user = await subs.get_or_create_user(db, 777)
+    await db.flush()
+    await subs.create_subscription(db, config, user, PLAN, source="test")
+    await db.flush()
+    return user
+
+
+async def test_buy_turns_into_renewal_with_single_subscription(db, config, remote) -> None:
+    user = await _user_with_key(db, config)
+    pay = await handlers._resolve_pay_target(db, config, user, "plan", str(PLAN.id))
+    assert pay.ok and pay.subscription is not None  # продление, а не второй ключ
+    assert pay.description.startswith("Продление")
+
+
+async def test_buy_creates_new_key_when_multiple_allowed(db, config, remote) -> None:
+    cfg = replace(config, allow_multiple_subscriptions=True)
+    user = await _user_with_key(db, cfg)
+    pay = await handlers._resolve_pay_target(db, cfg, user, "plan", str(PLAN.id))
+    assert pay.ok and pay.subscription is None
+
+
+async def test_pay_target_uses_global_discount(db, config) -> None:
+    cfg = replace(config, discount_percent=25)
+    user = await subs.get_or_create_user(db, 1)
+    await db.flush()
+    pay = await handlers._resolve_pay_target(db, cfg, user, "plan", str(PLAN.id))
+    assert pay.amount_kopeks == 29900
+
+
+# ── Уведомления о продажах ────────────────────────────────────────────
+async def test_sale_notification_kinds_and_escaping(db, config, monkeypatch) -> None:
+    sent = []
+
+    async def fake_sales(token, chat_id, text):
+        sent.append((chat_id, text))
+        return True
+
+    monkeypatch.setattr(subs, "notify_sales", fake_sales)
+    cfg = replace(config, purchase_notify_chat_id=-1001234567890)
+    user = await subs.get_or_create_user(db, 1, username="<evil>")
+    await db.flush()
+
+    await subs.after_paid_purchase(
+        db, cfg, user, 14000, plan_title="Месяц", kind="renewal", method="wallet"
+    )
+    chat_id, text = sent[0]
+    assert chat_id == -1001234567890
+    assert "Продление" in text and "140.00 ₽" in text and "баланс" in text
+    assert "<evil>" not in text
+
+
+# ── Сквозной сценарий: оплата с баланса через хендлер ─────────────────
+async def test_wallet_payment_renews_with_discount(config, remote, monkeypatch) -> None:
+    from app.services import wallet
+    from shared.db.base import Base
+    from shared.db.models import BotUser
+    from shared.db.session import SessionLocal
+    from shared.db.session import engine as shared_engine
+
+    async with shared_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+
+    monkeypatch.setattr(subs, "notify_sales", AsyncMock())
+    cfg = replace(config, discount_percent=25)
+    async with SessionLocal() as db:
+        user = await subs.get_or_create_user(db, 4242)
+        await db.flush()
+        await subs.create_subscription(db, cfg, user, PLAN, source="test")
+        await wallet.credit(db, user, 50000, wallet.WalletTxType.TOPUP)
+        await db.commit()
+        user_id = user.id
+
+    callback = MagicMock()
+    callback.from_user.id = 4242
+    callback.answer = AsyncMock()
+    callback.message.photo = None
+    callback.message.edit_text = AsyncMock()
+    callback.data = f"pay:plan:wallet:{PLAN.id}"
+    await handlers.cb_pay(callback, cfg, MagicMock())
+
+    async with SessionLocal() as db:
+        user = await db.get(BotUser, user_id)
+        keys = await subs.list_subscriptions(db, user)
+        balance = await db.scalar(select(Wallet.balance_kopeks).where(Wallet.user_id == user_id))
+    assert len(keys) == 1  # продлили, а не завели второй ключ
+    assert balance == 50000 - 29900
+    assert "Оплачено с баланса" in callback.message.edit_text.await_args.args[0]
+
+
+# ── Выдача администратору без оплаты ──────────────────────────────────
+def test_free_button_only_for_admin_and_only_for_purchases(config) -> None:
+    def free_in(markup) -> bool:
+        return any(c.endswith(":free:1") for c in _callbacks(markup))
+
+    assert free_in(keyboards.providers_menu(config, purpose="plan", target="1", free=True))
+    assert free_in(keyboards.providers_menu(config, purpose="renew", target="1", free=True))
+    assert not free_in(keyboards.providers_menu(config, purpose="plan", target="1"))
+    assert not free_in(keyboards.providers_menu(config, purpose="topup", target="1", free=True))
+
+
+async def _free_callback(cfg, user_id: int, data: str):
+    callback = MagicMock()
+    callback.from_user.id = user_id
+    callback.answer = AsyncMock()
+    callback.message.photo = None
+    callback.message.edit_text = AsyncMock()
+    callback.data = data
+    await handlers.cb_pay(callback, cfg, MagicMock())
+    return callback
+
+
+async def _fresh_db() -> None:
+    from shared.db.base import Base
+    from shared.db.session import engine as shared_engine
+
+    async with shared_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def test_admin_gets_subscription_for_free(config, remote, monkeypatch) -> None:
+    from shared.db.models import BotUser, Purchase
+    from shared.db.session import SessionLocal
+
+    await _fresh_db()
+    notify = AsyncMock()
+    monkeypatch.setattr(subs, "notify_sales", notify)
+    cfg = replace(config, admin_telegram_ids=[4242])
+
+    callback = await _free_callback(cfg, 4242, f"pay:plan:free:{PLAN.id}")
+
+    async with SessionLocal() as db:
+        user = await db.scalar(select(BotUser).where(BotUser.telegram_id == 4242))
+        keys = await subs.list_subscriptions(db, user)
+        purchase = await db.scalar(select(Purchase))
+        wallet_row = await db.scalar(select(Wallet).where(Wallet.user_id == user.id))
+    assert len(keys) == 1 and subs.is_active(user)
+    assert purchase.source == "admin" and purchase.amount_kopeks == 0
+    assert wallet_row is None or wallet_row.balance_kopeks == 0
+    assert "Выдано бесплатно" in callback.message.edit_text.await_args.args[0]
+    notify.assert_not_awaited()  # не продажа — в чат продаж ничего не уходит
+
+
+async def test_free_payment_is_refused_for_non_admin(config, remote) -> None:
+    from shared.db.models import BotUser
+    from shared.db.session import SessionLocal
+
+    await _fresh_db()
+    cfg = replace(config, admin_telegram_ids=[1])
+
+    callback = await _free_callback(cfg, 4242, f"pay:plan:free:{PLAN.id}")
+
+    callback.answer.assert_awaited_once()
+    assert callback.answer.await_args.kwargs.get("show_alert") is True
+    async with SessionLocal() as db:
+        assert await db.scalar(select(BotUser).where(BotUser.telegram_id == 4242)) is None
+
+
+# ── Лимит одного пополнения ───────────────────────────────────────────
+async def _topup_amount(config, text: str):
+    message = MagicMock()
+    message.text = text
+    message.answer = AsyncMock()
+    message.chat.id = 1
+    state = MagicMock()
+    state.clear = AsyncMock()
+    await handlers.on_topup_amount(message, state, config)
+    return message, state
+
+
+async def test_custom_topup_is_capped_at_10000(config) -> None:
+    for text in ("10001", "50000", "9", "-5", "abc", "nan", "inf"):
+        message, state = await _topup_amount(config, text)
+        assert "от 10 до 10000" in message.answer.await_args.args[0], text
+        state.clear.assert_not_awaited()
+
+    for text in ("10000", "10", "250,5"):
+        message, state = await _topup_amount(config, text)
+        state.clear.assert_awaited_once()
+
+
+async def test_forged_topup_callbacks_are_refused(config) -> None:
+    """callback_data подделывается: лимит держится и на выборе суммы, и на оплате."""
+    for amount in ("10001", "1000000", "nan"):
+        callback = MagicMock()
+        callback.answer = AsyncMock()
+        callback.data = f"topup:{amount}"
+        await handlers.cb_topup_preset(callback, config)
+        assert callback.answer.await_args.kwargs["show_alert"] is True
+
+        callback = MagicMock()
+        callback.from_user.id = 4242
+        callback.answer = AsyncMock()
+        callback.data = f"pay:topup:platega:{amount}"
+        await _fresh_db()
+        await handlers.cb_pay(callback, config, MagicMock())
+        assert callback.answer.await_args.kwargs["show_alert"] is True
+
+
+# ── Раскладка, цвета, кнопка меню, QR (1.6.1) ─────────────────────────
+def test_menu_columns(config) -> None:
+    cfg = replace(config, menu_columns=2, support_url="https://t.me/s", channel_url="https://t.me/c")
+    rows = _menu(cfg, has_subscription=True).inline_keyboard
+    assert all(len(row) <= 2 for row in rows)
+    assert max(len(row) for row in rows) == 2
+    three = replace(cfg, menu_columns=3)
+    assert max(len(row) for row in _menu(three, has_subscription=True).inline_keyboard) == 3
+
+
+def test_menu_button_colors(config) -> None:
+    cfg = replace(config, menu_styles={"buy": "danger", "trial": "none"})
+    markup = keyboards.main_menu(
+        cfg, trial_available=True, has_subscription=False, balance_kopeks=0
+    )
+    by_data = {b.callback_data: b for b in _buttons(markup)}
+    assert by_data["plans"].style == "danger"
+    assert by_data["trial"].style is None  # «none» снимает цвет по умолчанию
+    assert by_data["promo"].style is None
+
+
+def test_commands_mode_removes_reply_keyboard(config) -> None:
+    from aiogram.types import ReplyKeyboardMarkup, ReplyKeyboardRemove
+
+    assert isinstance(keyboards.bottom_keyboard(config), ReplyKeyboardMarkup)
+    assert isinstance(
+        keyboards.bottom_keyboard(replace(config, menu_mode="commands")), ReplyKeyboardRemove
+    )
+
+
+def test_qr_png() -> None:
+    assert handlers.qr_png("https://sub.example/abc").startswith(b"\x89PNG")
+
+
+async def test_bedolaga_referral_codes_are_case_sensitive(db, config) -> None:
+    from app.services import referral
+
+    cfg = replace(config, referral_enabled=True)
+    referrer = await subs.get_or_create_user(db, 1)
+    referrer.referral_code = "refAbC12345"
+    newbie = await subs.get_or_create_user(db, 2)
+    await db.flush()
+    found = await referral.attach_referrer(db, cfg, newbie, "refAbC12345")
+    assert found is not None and newbie.referred_by_id == referrer.id
+
+
+def test_referral_payloads_of_migrated_bots() -> None:
+    parse = handlers.referral_code_from_payload
+    assert parse("ref_ABC123") == "ABC123"
+    assert parse("refAbC12345") == "refAbC12345"  # Bedolaga
+    assert parse("ref_REF-AB12CD34") == "REF-AB12CD34"  # STEALTHNET
+    assert parse("ref_REF-AB12CD34__s_tiktok__m_ads") == "REF-AB12CD34"
+    assert parse("ref_REF-AB12CD34_c_fb_summer") == "REF-AB12CD34"

@@ -1,0 +1,315 @@
+import asyncio
+import html
+import os
+import re
+import uuid
+from datetime import UTC, datetime
+from urllib.parse import urlparse
+
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from pydantic import BaseModel, Field, field_validator, model_validator
+from sqlalchemy import func, select
+
+from app.api.deps import CurrentAdmin, DbSession
+from app.core.config import settings
+from app.db.session import SessionLocal
+from shared import bus
+from shared.db.models import AuditLog, Broadcast, BroadcastSegment, BroadcastStatus
+from shared.segments import recipients_query
+
+router = APIRouter(prefix="/broadcasts", tags=["broadcasts"])
+
+MAX_PHOTO_BYTES = 8 * 1024 * 1024  # 8 МБ — с запасом под лимит Telegram (10 МБ)
+ALLOWED_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+# Подпись к фото в Telegram — не длиннее 1024 видимых символов. Длиннее —
+# Telegram отклоняет сообщение каждому получателю, рассылка уходит в ноль.
+MAX_CAPTION = 1024
+MAX_TEXT = 4096
+
+_TAG = re.compile(r"<[^>]+>")
+
+
+def visible_length(text: str) -> int:
+    """Длина так, как её считает Telegram: без HTML-тегов, сущности — как символ."""
+    return len(html.unescape(_TAG.sub("", text)))
+
+
+def local_upload_path(photo_url: str | None) -> str | None:
+    if not photo_url:
+        return None
+    path = urlparse(photo_url).path
+    if not path.startswith("/uploads/"):
+        return None
+    name = os.path.basename(path)
+    full = os.path.join(settings.upload_dir, name)
+    return full if name and os.path.isfile(full) else None
+
+
+@router.post("/upload-photo")
+async def upload_photo(admin: CurrentAdmin, file: UploadFile) -> dict:
+    """Сохраняет фото для рассылки и отдаёт публичный URL — его скачает
+    Telegram при отправке сообщения, поэтому файл должен быть доступен
+    без авторизации (см. caddy/panel.snippet, /uploads/*)."""
+    ext = ALLOWED_TYPES.get(file.content_type or "")
+    if ext is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Поддерживаются только JPEG, PNG и WebP",
+        )
+
+    body = await file.read(MAX_PHOTO_BYTES + 1)
+    if len(body) > MAX_PHOTO_BYTES:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Файл больше 8 МБ")
+
+    os.makedirs(settings.upload_dir, exist_ok=True)
+    name = f"{uuid.uuid4().hex}{ext}"
+    with open(os.path.join(settings.upload_dir, name), "wb") as f:
+        f.write(body)
+
+    return {"url": f"{settings.public_url}/uploads/{name}"}
+
+
+class ButtonIn(BaseModel):
+    text: str = Field(min_length=1, max_length=64)
+    url: str = Field(min_length=1, max_length=512)
+
+
+class BroadcastContent(BaseModel):
+    text: str = Field(min_length=1, max_length=20000)
+    photo_url: str | None = Field(default=None, max_length=512)
+    buttons: list[ButtonIn] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def _fits_telegram(self) -> "BroadcastContent":
+        length = visible_length(self.text)
+        if self.photo_url and length > MAX_CAPTION:
+            raise ValueError(
+                f"С фото текст должен быть не длиннее {MAX_CAPTION} символов "
+                f"(сейчас {length}) — это ограничение Telegram на подпись к фото"
+            )
+        if length > MAX_TEXT:
+            raise ValueError(f"Текст длиннее {MAX_TEXT} символов (сейчас {length})")
+        for button in self.buttons:
+            if not button.url.startswith(("https://", "http://", "tg://")):
+                raise ValueError(f"Ссылка кнопки «{button.text}» должна начинаться с https://")
+        return self
+
+
+class BroadcastIn(BroadcastContent):
+    segment: BroadcastSegment = BroadcastSegment.ALL
+    # Пусто = отправить сейчас.
+    scheduled_at: datetime | None = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def _not_in_past(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        now = datetime.now(UTC)
+        check = value if value.tzinfo else value.replace(tzinfo=UTC)
+        if check < now:
+            raise ValueError("Время отправки не может быть в прошлом")
+        return value
+
+
+class BroadcastOut(BaseModel):
+    id: int
+    text: str
+    photo_url: str | None
+    buttons: list[ButtonIn]
+    segment: str
+    status: str
+    scheduled_at: datetime
+    total_recipients: int
+    sent_count: int
+    failed_count: int
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+def _out(b: Broadcast) -> BroadcastOut:
+    return BroadcastOut(
+        id=b.id,
+        text=b.text,
+        photo_url=b.photo_url,
+        buttons=[ButtonIn.model_validate(x) for x in (b.buttons or [])],
+        segment=str(b.segment),
+        status=str(b.status),
+        scheduled_at=b.scheduled_at,
+        total_recipients=b.total_recipients,
+        sent_count=b.sent_count,
+        failed_count=b.failed_count,
+        created_at=b.created_at,
+        started_at=b.started_at,
+        finished_at=b.finished_at,
+    )
+
+
+@router.get("", response_model=list[BroadcastOut])
+async def list_broadcasts(admin: CurrentAdmin, db: DbSession) -> list[BroadcastOut]:
+    rows = await db.scalars(select(Broadcast).order_by(Broadcast.created_at.desc()))
+    return [_out(b) for b in rows]
+
+
+@router.get("/segments/counts")
+async def segment_counts(admin: CurrentAdmin, db: DbSession) -> dict[str, int]:
+    """Предпросмотр размера сегмента до отправки — чтобы не разослать
+    рассылку «всем», думая, что она уйдёт десятку активных клиентов."""
+    result = {}
+    for segment in BroadcastSegment:
+        count = await db.scalar(
+            select(func.count()).select_from(recipients_query(segment).subquery())
+        )
+        result[segment.value] = count or 0
+    return result
+
+
+@router.post("", response_model=BroadcastOut, status_code=status.HTTP_201_CREATED)
+async def create_broadcast(
+    data: BroadcastIn, admin: CurrentAdmin, db: DbSession, request: Request
+) -> BroadcastOut:
+    now = datetime.now(UTC)
+    send_now = data.scheduled_at is None
+
+    broadcast = Broadcast(
+        text=data.text,
+        photo_url=data.photo_url,
+        buttons=[b.model_dump() for b in data.buttons],
+        segment=data.segment,
+        status=BroadcastStatus.SCHEDULED,
+        scheduled_at=data.scheduled_at or now,
+        created_by_admin_id=admin.id,
+        created_at=now,
+    )
+    db.add(broadcast)
+    db.add(
+        AuditLog(
+            admin_id=admin.id,
+            action="broadcast.create",
+            details={"segment": data.segment.value, "scheduled": not send_now},
+            ip=request.client.host if request.client else None,
+            created_at=now,
+        )
+    )
+    await db.flush()
+    out = _out(broadcast)
+
+    if send_now:
+        # Коммит до pub/sub: воркер бота читает рассылку своей сессией и
+        # без коммита не нашёл бы её (та же гонка, что у платежей).
+        await db.commit()
+        await bus.publish(bus.EVENT_BROADCAST_READY)
+
+    return out
+
+
+class TestOut(BaseModel):
+    ok: bool
+    message: str
+
+
+@router.post("/test", response_model=TestOut)
+async def test_broadcast(
+    data: BroadcastContent, admin: CurrentAdmin, db: DbSession
+) -> TestOut:
+    """Отправляет рассылку только администраторам бота (Бот → Администраторы)
+    — посмотреть фото, подпись, кнопки и разметку до отправки всем."""
+    from app.services import telegram
+    from shared.crypto import decrypt
+    from shared.db.models import BotConfig
+
+    row = await db.get(BotConfig, 1)
+    if row is None or not row.token_encrypted:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Сначала подключите бота")
+    if not row.admin_telegram_ids:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Укажите свой Telegram ID в «Бот → Уведомления и админы» — туда придёт тест",
+        )
+    token = decrypt(row.token_encrypted)
+    buttons = [b.model_dump() for b in data.buttons]
+    errors = []
+    for chat_id in row.admin_telegram_ids:
+        try:
+            await telegram.send_broadcast_test(
+                token,
+                chat_id,
+                data.text,
+                photo_path=local_upload_path(data.photo_url),
+                photo_url=data.photo_url,
+                buttons=buttons,
+            )
+        except telegram.TelegramError as exc:
+            errors.append(f"{chat_id}: {exc}")
+    if errors:
+        return TestOut(ok=False, message="Telegram отклонил: " + "; ".join(errors))
+    return TestOut(ok=True, message="Тест отправлен администраторам бота")
+
+
+@router.delete("/{broadcast_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_broadcast(
+    broadcast_id: int, admin: CurrentAdmin, db: DbSession, request: Request
+) -> None:
+    broadcast = await db.get(Broadcast, broadcast_id)
+    if broadcast is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Рассылка не найдена")
+    # Идущую рассылку тоже можно остановить: воркер бота проверяет статус
+    # после каждого сообщения и прекращает отправку на отменённой.
+    if broadcast.status not in (BroadcastStatus.SCHEDULED, BroadcastStatus.SENDING):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Рассылка уже завершена — отменить нельзя",
+        )
+    broadcast.status = BroadcastStatus.CANCELLED
+    db.add(
+        AuditLog(
+            admin_id=admin.id,
+            action="broadcast.cancel",
+            target=str(broadcast_id),
+            ip=request.client.host if request.client else None,
+            created_at=datetime.now(UTC),
+        )
+    )
+
+
+@router.websocket("/{broadcast_id}/ws")
+async def broadcast_progress(
+    websocket: WebSocket, broadcast_id: int, admin: CurrentAdmin
+) -> None:
+    """Живой прогресс отправки. Закрывается сам, когда статус — терминальный.
+
+    `admin: CurrentAdmin` резолвится FastAPI ещё до входа в функцию — так же,
+    как для обычного HTTP-эндпоинта: неавторизованный handshake будет
+    отклонён раньше, чем мы примем соединение.
+    """
+    await websocket.accept()
+    try:
+        while True:
+            async with SessionLocal() as db:
+                broadcast = await db.get(Broadcast, broadcast_id)
+                if broadcast is None:
+                    await websocket.send_json({"error": "not_found"})
+                    break
+                await websocket.send_json(_out(broadcast).model_dump(mode="json"))
+                if broadcast.status in (
+                    BroadcastStatus.COMPLETED,
+                    BroadcastStatus.CANCELLED,
+                ):
+                    break
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass  # уже закрыт клиентом

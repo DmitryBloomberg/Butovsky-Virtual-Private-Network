@@ -1,0 +1,898 @@
+from datetime import datetime
+from enum import StrEnum
+from typing import Any
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from shared.db.base import Base, TimestampMixin
+
+
+class Admin(Base, TimestampMixin):
+    """Администратор панели. В Free-редакции разрешён только один."""
+
+    __tablename__ = "admins"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    login: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_owner: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # 2FA (TOTP). В режиме ip панель требует его включить.
+    totp_secret: Mapped[str | None] = mapped_column(String(64), default=None)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Входит в каждый access-токен. «Выйти везде» и смена пароля увеличивают
+    # её — уже выданные токены перестают действовать сразу, а не через час.
+    token_version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+        back_populates="admin", cascade="all, delete-orphan"
+    )
+
+
+class RefreshToken(Base, TimestampMixin):
+    """Refresh-токен сессии. Хранится хэш — утечка БД не даёт войти."""
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    admin_id: Mapped[int] = mapped_column(
+        ForeignKey("admins.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    user_agent: Mapped[str | None] = mapped_column(String(255), default=None)
+    ip: Mapped[str | None] = mapped_column(String(45), default=None)
+
+    admin: Mapped[Admin] = relationship(back_populates="refresh_tokens")
+
+
+class AuditLog(Base):
+    """Журнал действий: кто, что и когда менял в панели."""
+
+    __tablename__ = "audit_log"
+    __table_args__ = (Index("ix_audit_log_created_at_desc", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    admin_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admins.id", ondelete="SET NULL"), default=None
+    )
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    target: Mapped[str | None] = mapped_column(String(128), default=None)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    ip: Mapped[str | None] = mapped_column(String(45), default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class Setting(Base, TimestampMixin):
+    """Конфигурация панели: подключение к Remnawave, бренд, бот и прочее.
+
+    Ключ-значение вместо .env — пользователь правит всё через UI, без ssh.
+    Секреты (токены, ключи API) шифруются Fernet перед записью: колонка
+    `is_secret` помечает такие записи, наружу они отдаются маскированными.
+    """
+
+    __tablename__ = "settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str | None] = mapped_column(Text, default=None)
+    is_secret: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+# ══ Telegram-бот ══════════════════════════════════════════════════════
+class EmojiMode(StrEnum):
+    """Набор эмодзи в сообщениях бота.
+
+    PREMIUM использует кастомные анимированные эмодзи Telegram. Они
+    работают, только если у аккаунта, создавшего бота в @BotFather,
+    активен Telegram Premium, — панель проверяет это перед включением.
+    """
+
+    PLAIN = "plain"
+    PREMIUM = "premium"
+
+
+class BotState(StrEnum):
+    STOPPED = "stopped"
+    RUNNING = "running"
+    ERROR = "error"
+
+
+class BotConfig(Base, TimestampMixin):
+    """Единственная строка с настройками бота — правится из панели.
+
+    Токен хранится зашифрованным. Смена токена не требует перезапуска
+    контейнера: панель шлёт боту команду через Redis.
+    """
+
+    __tablename__ = "bot_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+
+    token_encrypted: Mapped[str | None] = mapped_column(Text, default=None)
+    # SOCKS5-прокси до Telegram (socks5://user:pass@host:port), зашифрован:
+    # на серверах в РФ api.telegram.org недоступен напрямую.
+    proxy_encrypted: Mapped[str | None] = mapped_column(Text, default=None)
+    bot_username: Mapped[str | None] = mapped_column(String(64), default=None)
+    bot_name: Mapped[str | None] = mapped_column(String(128), default=None)
+    bot_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    state: Mapped[BotState] = mapped_column(
+        String(16), default=BotState.STOPPED, nullable=False
+    )
+    state_message: Mapped[str | None] = mapped_column(Text, default=None)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+    emoji_mode: Mapped[EmojiMode] = mapped_column(
+        String(16), default=EmojiMode.PLAIN, nullable=False
+    )
+    # Результат последней проверки Premium — чтобы UI объяснял отказ.
+    premium_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    premium_available: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    # «иконка → id премиум-эмодзи». Пусто = премиум-режим рисует обычные
+    # символы: универсальных id не существует, их задаёт владелец панели.
+    premium_emoji: Mapped[dict[str, str]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+
+    # Приветствие, поддержка, обязательная подписка на канал.
+    welcome_text: Mapped[str | None] = mapped_column(Text, default=None)
+    support_url: Mapped[str | None] = mapped_column(String(255), default=None)
+    channel_url: Mapped[str | None] = mapped_column(String(255), default=None)
+    channel_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    require_channel_sub: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    trial_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    trial_days: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    trial_squad_uuids: Mapped[list[str]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    trial_hwid_limit: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    trial_traffic_gb: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Рекламные ссылки с процентом от покупок — выключены, пока админ не
+    # включит их в панели (Бот → внизу страницы).
+    ad_links_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    referral_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    # Дни, которые получает пригласивший, когда приглашённый совершает
+    # первую оплату (не за сам факт регистрации — иначе это открывает
+    # накрутку пустыми аккаунтами).
+    referral_reward_days: Mapped[int] = mapped_column(
+        Integer, default=3, nullable=False
+    )
+    # Бонусные дни самому приглашённому за переход по ссылке.
+    referral_bonus_days: Mapped[int] = mapped_column(
+        Integer, default=1, nullable=False
+    )
+
+    # Денежная 2-уровневая комиссия рефереру на баланс — начисляется с
+    # КАЖДОЙ оплаты приглашённого (в отличие от разового referral_reward_days
+    # за первую покупку). Уровень 2 — комиссия того, кто пригласил реферера.
+    referral_commission_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    referral_level1_percent: Mapped[int] = mapped_column(
+        Integer, default=25, nullable=False
+    )
+    referral_level2_percent: Mapped[int] = mapped_column(
+        Integer, default=5, nullable=False
+    )
+
+    # Уведомление о каждой продаже в отдельный чат/группу (бот должен
+    # состоять в ней участником). 0/None — уведомления отключены.
+    purchase_notify_chat_id: Mapped[int | None] = mapped_column(
+        BigInteger, default=None
+    )
+
+    # Telegram ID администраторов — им бот открывает команду /admin со
+    # встроенной статистикой. Не путать с админами веб-панели (таблица
+    # admins): это про доступ внутри самого Telegram-бота.
+    admin_telegram_ids: Mapped[list[int]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+
+    # Ссылки на юридические документы — кнопками в профиле бота. Пусто —
+    # кнопка просто не показывается, ничего не ломается.
+    privacy_policy_url: Mapped[str | None] = mapped_column(String(512), default=None)
+    terms_url: Mapped[str | None] = mapped_column(String(512), default=None)
+
+    # Картинка над каждым экраном бота: имя файла в общем томе uploads.
+    # Хранится имя, а не ссылка: бот берёт файл с диска и не зависит от
+    # того, доступен ли адрес панели снаружи.
+    menu_photo: Mapped[str | None] = mapped_column(String(255), default=None)
+
+    # Алерты о падении нод (Pro) — шлются этому чату из бота.
+    node_alerts_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    node_alerts_chat_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+
+    # Общая скидка на все обычные тарифы (персональные не трогает — у них
+    # и так своя цена). discount_until пусто — скидка бессрочная.
+    discount_percent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    discount_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+    # False — у клиента одна подписка: «Купить» при уже купленной подписке
+    # продлевает её, а не заводит второй ключ. True — как раньше, каждая
+    # покупка через «Купить ещё одну» создаёт отдельный ключ.
+    allow_multiple_subscriptions: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    # Кнопки главного меню, которые админ скрыл в панели (см. MENU_BUTTONS
+    # в bot/app/keyboards.py): "support", "promo", "profile", ...
+    menu_hidden: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    # Сколько кнопок главного меню в ряд: 1, 2 или 3.
+    menu_columns: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # Цвет кнопок меню: {"buy": "success", "promo": "none", ...}. Нет ключа —
+    # цвет по умолчанию из кода (см. keyboards.DEFAULT_STYLES).
+    menu_styles: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
+    # Где «Меню» и «Помощь»: "keyboard" — клавиатура под полем ввода,
+    # "commands" — кнопка меню Telegram слева от поля (не мешает жесту
+    # «назад» на телефоне).
+    menu_mode: Mapped[str] = mapped_column(String(16), default="commands", nullable=False)
+
+    # Свои подписи кнопок и тексты сообщений: только то, что отличается от
+    # стандартного (реестр — shared/botcopy.py).
+    menu_labels: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
+    bot_texts: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, nullable=False)
+
+    # Когда бот в последний раз применил настройки из панели — панель по
+    # этому отметке показывает, что изменения действительно дошли.
+    config_applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+    # ── Поддержка ─────────────────────────────────────────────────────
+    # "link" — кнопка «Поддержка» ведёт на @username или ссылку (support_url);
+    # "bot" — отдельный бот поддержки: клиент пишет ему, сообщения попадают
+    # в темы (топики) группы операторов, ответы уходят клиенту обратно.
+    support_mode: Mapped[str] = mapped_column(
+        String(16), default="link", server_default="link", nullable=False
+    )
+    support_token_encrypted: Mapped[str | None] = mapped_column(Text, default=None)
+    support_bot_username: Mapped[str | None] = mapped_column(String(64), default=None)
+    support_bot_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # Группа операторов с включёнными темами.
+    support_chat_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # Кто может отвечать клиентам, кроме администраторов самой группы.
+    support_admin_ids: Mapped[list[int] | None] = mapped_column(JSON, default=list)
+    support_welcome: Mapped[str | None] = mapped_column(Text, default=None)
+    support_state: Mapped[str] = mapped_column(
+        String(16), default="stopped", server_default="stopped", nullable=False
+    )
+    support_state_message: Mapped[str | None] = mapped_column(Text, default=None)
+    # Последняя группа, в которую добавили бота поддержки: панель предлагает
+    # её как «ID группы», чтобы не искать его руками.
+    support_seen_chat_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    support_seen_chat_title: Mapped[str | None] = mapped_column(String(255), default=None)
+
+
+class SupportTicket(Base):
+    """Обращение в поддержку: одна тема (топик) группы на клиента.
+
+    Закрыли обращение (/close) — тема закрывается, а следующее сообщение
+    клиента заводит новую."""
+
+    __tablename__ = "support_tickets"
+    __table_args__ = (
+        Index("ix_support_tickets_user", "user_telegram_id"),
+        Index("ix_support_tickets_thread", "chat_id", "thread_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    thread_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    username: Mapped[str | None] = mapped_column(String(64), default=None)
+    status: Mapped[str] = mapped_column(String(16), default="open", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class PlanCategory(Base, TimestampMixin):
+    """Категория тарифов (например «VPN», «VPN + LTE») — заводится в панели.
+
+    Раньше в боте типы тарифов были константами в коде (VPN / VPN+LTE).
+    Здесь админ сам создаёт, переименовывает и удаляет любые категории —
+    бот показывает их вкладками в меню тарифов.
+    """
+
+    __tablename__ = "bot_plan_categories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(64), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    plans: Mapped[list["Plan"]] = relationship(back_populates="category")
+
+
+class Plan(Base, TimestampMixin):
+    """Тариф в боте: срок, цена, сквады Remnawave и лимит устройств.
+
+    В старом боте всё это было константами в config.py, а squad-UUID —
+    захардкожены в коде. Здесь каждый тариф настраивается из панели.
+    """
+
+    __tablename__ = "bot_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(64), nullable=False)
+    days: Mapped[int] = mapped_column(Integer, nullable=False)
+    price_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    squad_uuids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    hwid_limit: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    traffic_limit_bytes: Mapped[int] = mapped_column(
+        BigInteger, default=0, nullable=False
+    )
+
+    # Не обязательна: тариф без категории просто не попадает ни в одну
+    # вкладку и показывается в общем списке (для панелей с одной категорией).
+    category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_plan_categories.id", ondelete="SET NULL"), default=None
+    )
+    category: Mapped[PlanCategory | None] = relationship(back_populates="plans")
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Персональный тариф: виден в боте только этому пользователю, общая
+    # скидка на него не действует. NULL — обычный тариф для всех.
+    # use_alter: bot_users и bot_plans ссылаются друг на друга
+    # (auto_renew_plan_id), без него create_all не может упорядочить таблицы.
+    owner_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "bot_users.id",
+            ondelete="CASCADE",
+            use_alter=True,
+            name="fk_bot_plans_owner_user_id",
+        ),
+        default=None,
+        index=True,
+    )
+
+    @property
+    def price_rub(self) -> float:
+        return self.price_kopeks / 100
+
+
+class TrafficPackage(Base, TimestampMixin):
+    """Пакет докупаемого трафика: сколько гигабайт и за сколько.
+
+    Remnawave не умеет «добавить трафик» отдельной операцией — есть только
+    лимит пользователя, поэтому покупка поднимает `trafficLimitBytes` на
+    размер пакета (см. app/services/subscriptions.py).
+    """
+
+    __tablename__ = "bot_traffic_packages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(64), nullable=False)
+    traffic_gb: Mapped[int] = mapped_column(Integer, nullable=False)
+    price_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    @property
+    def traffic_bytes(self) -> int:
+        return self.traffic_gb * 1024**3
+
+
+class BotUser(Base, TimestampMixin):
+    """Пользователь бота. Связь с Remnawave — по uuid, выданному при покупке.
+
+    Привязка идёт к telegram_id, поэтому смена токена бота не теряет базу
+    клиентов: тот же человек в новом боте остаётся тем же пользователем.
+    """
+
+    __tablename__ = "bot_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(
+        BigInteger, unique=True, nullable=False, index=True
+    )
+    username: Mapped[str | None] = mapped_column(String(64), default=None)
+    first_name: Mapped[str | None] = mapped_column(String(128), default=None)
+    language_code: Mapped[str | None] = mapped_column(String(8), default=None)
+
+    remnawave_uuid: Mapped[str | None] = mapped_column(String(64), default=None)
+    subscription_url: Mapped[str | None] = mapped_column(Text, default=None)
+    expire_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+    trial_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Бот уже искал существующие аккаунты этого пользователя в Remnawave по
+    # telegram_id и подхватил их. Флаг не даёт дёргать Remnawave на каждый
+    # /start; сбрасывается, когда админ пересинхронизирует пользователя.
+    remnawave_synced: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    is_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Пользователь заблокировал бота — рассылка на него не тратится.
+    has_stopped_bot: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Какая клавиатура под полем ввода уже стоит у клиента (см.
+    # keyboards.keyboard_state). Совпадает с нужной — отдельное сообщение
+    # с клавиатурой на /start не шлём.
+    keyboard_state: Mapped[str | None] = mapped_column(String(32), default=None)
+
+    # Свой код для реферальной ссылки — стабилен даже после смены бота.
+    referral_code: Mapped[str | None] = mapped_column(
+        String(16), unique=True, default=None
+    )
+    referred_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="SET NULL"), default=None
+    )
+    referral_reward_paid: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    # Рекламная ссылка, по которой пришёл пользователь (первое касание).
+    ad_link_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_ad_links.id", ondelete="SET NULL"), default=None, index=True
+    )
+
+    # Персональная скидка на следующую оплату тарифа (из промокода).
+    # Сгорает после первой успешной покупки, как в исходном боте.
+    discount_percent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    auto_renew_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    auto_renew_plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_plans.id", ondelete="SET NULL"), default=None
+    )
+    # Какую подписку продлевать автоплатежом. NULL — «основную» (первую
+    # выданную), см. BotSubscription.
+    auto_renew_subscription_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "bot_subscriptions.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_bot_users_auto_renew_subscription_id",
+        ),
+        default=None,
+    )
+
+    purchases: Mapped[list["Purchase"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    subscriptions: Mapped[list["BotSubscription"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="BotSubscription.user_id",
+    )
+
+
+class BotSubscription(Base, TimestampMixin):
+    """Один купленный «ключ» — отдельный аккаунт Remnawave.
+
+    У пользователя бота может быть несколько таких записей: как в исходном
+    боте, каждая покупка тарифа заводит новый независимый ключ вместо
+    продления единственного. Первая подписка при этом продолжает
+    зеркалироваться в `BotUser.remnawave_uuid/expire_at` — этим полям
+    по-прежнему верят триал, автопродление и напоминания об истечении,
+    рассчитанные на «основную» подписку.
+    """
+
+    __tablename__ = "bot_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    remnawave_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # uuid ключа в Remnawave. Заполнен только у старых панелей (до 2.9),
+    # где пользователь адресуется именно им, а не числовым id.
+    remnawave_uuid: Mapped[str | None] = mapped_column(String(64), default=None)
+    username: Mapped[str] = mapped_column(String(64), nullable=False)
+    subscription_url: Mapped[str | None] = mapped_column(Text, default=None)
+    expire_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_plans.id", ondelete="SET NULL"), default=None
+    )
+    # Название тарифа на момент покупки. Тариф могут переименовать или
+    # удалить (plan_id тогда обнуляется), а ключ у клиента остаётся — без
+    # снимка имени подписка превращалась бы в безымянную.
+    title: Mapped[str | None] = mapped_column(String(64), default=None)
+    # Пробный ключ. Отдельный признак, а не «plan_id пустой»: пустым он
+    # становится и у платной подписки, если админ удалил её тариф.
+    is_trial: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Автопродление с баланса именно этого ключа (по тарифу plan_id) —
+    # переключается пользователем в карточке ключа.
+    auto_renew: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    user: Mapped[BotUser] = relationship(
+        back_populates="subscriptions", foreign_keys=[user_id]
+    )
+
+    @property
+    def remote_ref(self) -> int | str:
+        """Чем обращаться к Remnawave: uuid у старых панелей, id у новых."""
+        return self.remnawave_uuid or self.remnawave_id
+
+
+class Purchase(Base, TimestampMixin):
+    """Факт выдачи подписки: покупка, триал или ручная выдача из панели."""
+
+    __tablename__ = "bot_purchases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_plans.id", ondelete="SET NULL"), default=None
+    )
+    # Снимок названия тарифа — история покупок не должна пустеть после
+    # удаления тарифа в панели.
+    plan_title: Mapped[str | None] = mapped_column(String(64), default=None)
+    subscription_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_subscriptions.id", ondelete="SET NULL"), default=None
+    )
+
+    days: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_kopeks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    expire_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+    user: Mapped[BotUser] = relationship(back_populates="purchases")
+
+
+class ExpiryNotification(Base):
+    """Отметка об отправленном напоминании — защита от повторов.
+
+    Уникальность по (пользователь, окно, дата истечения): продлил подписку —
+    появится новая дата, и напоминания придут заново.
+    """
+
+    __tablename__ = "bot_expiry_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "window", "expire_at", name="uq_expiry_notification"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False
+    )
+    window: Mapped[str] = mapped_column(String(16), nullable=False)
+    expire_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# ══ Монетизация ═══════════════════════════════════════════════════════
+class PaymentProvider(StrEnum):
+    PLATEGA = "platega"
+    ROLLYPAY = "rollypay"
+    CISPAY = "cispay"
+    CRYPTOBOT = "cryptobot"
+    STARS = "stars"
+
+
+class PaymentPurpose(StrEnum):
+    TOPUP = "topup"
+    PLAN = "plan"
+    TRAFFIC = "traffic"
+
+
+class PaymentStatus(StrEnum):
+    PENDING = "pending"
+    PAID = "paid"
+    FAILED = "failed"
+    EXPIRED = "expired"
+
+
+class WalletTxType(StrEnum):
+    TOPUP = "topup"
+    PURCHASE = "purchase"
+    REFUND = "refund"
+    REFERRAL_REWARD = "referral_reward"
+    ADMIN_ADJUST = "admin_adjust"
+    AUTO_RENEWAL = "auto_renewal"
+
+
+class Wallet(Base, TimestampMixin):
+    """Внутренний баланс пользователя бота — в копейках, без учёта валют."""
+
+    __tablename__ = "bot_wallets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    balance_kopeks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class WalletTransaction(Base, TimestampMixin):
+    """Движение по балансу — как выписка, а не просто текущее число."""
+
+    __tablename__ = "bot_wallet_transactions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wallet_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_wallets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Положительное — пополнение, отрицательное — списание.
+    amount_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    type: Mapped[WalletTxType] = mapped_column(String(24), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(255), default=None)
+
+
+class Payment(Base, TimestampMixin):
+    """Внешняя оплата: пополнение кошелька или прямая покупка тарифа.
+
+    external_id — идентификатор транзакции у провайдера, по нему находим
+    платёж, когда приходит вебхук.
+    """
+
+    __tablename__ = "bot_payments"
+    __table_args__ = (
+        UniqueConstraint("provider", "external_id", name="uq_payment_external"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider: Mapped[PaymentProvider] = mapped_column(String(16), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    amount_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    purpose: Mapped[PaymentPurpose] = mapped_column(String(16), nullable=False)
+    plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_plans.id", ondelete="SET NULL"), default=None
+    )
+    # Заполнено только для продления конкретного ключа (не для новой
+    # покупки и не для пополнения баланса): какую именно подписку продлить,
+    # когда придёт подтверждение оплаты.
+    subscription_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_subscriptions.id", ondelete="SET NULL"), default=None
+    )
+    # Заполнено только для докупки трафика.
+    traffic_package_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_traffic_packages.id", ondelete="SET NULL"), default=None
+    )
+    status: Mapped[PaymentStatus] = mapped_column(
+        String(16), default=PaymentStatus.PENDING, nullable=False
+    )
+    paid_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Момент, когда бот применил оплату (зачислил/продлил). Отдельно от
+    # paid_at: если Redis-уведомление потерялось, воркер бота находит все
+    # payment.status=paid c applied_at IS NULL и обрабатывает их сам —
+    # деньги не должны теряться из-за недоставленного pub/sub-сообщения.
+    applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Сырое тело последнего колбэка провайдера — пригодится для разбора спорных случаев.
+    raw_payload: Mapped[dict | None] = mapped_column(JSON, default=None)
+
+
+class PromoCode(Base, TimestampMixin):
+    """Промокод: бонусные дни или скидка на покупку тарифа."""
+
+    __tablename__ = "bot_promo_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+
+    bonus_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    discount_percent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    max_uses: Mapped[int | None] = mapped_column(Integer, default=None)
+    uses_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class PromoCodeActivation(Base):
+    """Факт использования — один промокод на пользователя, не больше."""
+
+    __tablename__ = "bot_promo_code_activations"
+    __table_args__ = (
+        UniqueConstraint("promo_code_id", "user_id", name="uq_promo_activation"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    promo_code_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_promo_codes.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ReferralReward(Base):
+    """Начисление рефереру — по факту первой оплаты приглашённого."""
+
+    __tablename__ = "bot_referral_rewards"
+    __table_args__ = (
+        UniqueConstraint("referred_user_id", name="uq_referral_reward_once"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    referrer_user_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    referred_user_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False
+    )
+    days: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class AdLink(Base):
+    """Рекламная ссылка t.me/bot?start=<prefix>: владелец получает процент
+    с каждой оплаты тарифа привлечённых пользователей и видит статистику
+    в боте. Владелец — по Telegram ID или @username (username превращается в
+    ID, когда человек появится в боте)."""
+
+    __tablename__ = "bot_ad_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    prefix: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    percent: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
+    owner_telegram_id: Mapped[int | None] = mapped_column(
+        BigInteger, default=None, index=True
+    )
+    owner_username: Mapped[str | None] = mapped_column(String(64), default=None)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # "balance" — доля сразу идёт на баланс владельца в боте; "manual" —
+    # только копится в статистике, админ платит сам и обнуляет «к выплате».
+    payout_mode: Mapped[str] = mapped_column(
+        String(16), default="balance", server_default="balance", nullable=False
+    )
+    # Сколько уже выплачено владельцу (обнуления админом), в копейках.
+    paid_out_kopeks: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class AdEarning(Base):
+    """Одна оплата привлечённого пользователя и положенная владельцу доля.
+    `paid` — доля уже зачислена на баланс владельца (если он ещё не нашёлся
+    в боте, копится и зачисляется позже)."""
+
+    __tablename__ = "bot_ad_earnings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ad_link_id: Mapped[int] = mapped_column(
+        ForeignKey("bot_ad_links.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    buyer_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bot_users.id", ondelete="SET NULL"), default=None
+    )
+    amount_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    commission_kopeks: Mapped[int] = mapped_column(Integer, nullable=False)
+    paid: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+# ══ Рассылки ═══════════════════════════════════════════════════════════
+class BroadcastSegment(StrEnum):
+    ALL = "all"
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    NO_PURCHASE = "no_purchase"
+
+
+class BroadcastStatus(StrEnum):
+    SCHEDULED = "scheduled"
+    SENDING = "sending"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class Broadcast(Base):
+    """Рассылка: текст/фото/кнопки, сегмент получателей, план или факт отправки.
+
+    Отправляет бот (у него живой Bot-инстанс), панель только заводит запись
+    и читает прогресс — так разделение обязанностей остаётся тем же, что и
+    у платежей.
+    """
+
+    __tablename__ = "broadcasts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    photo_url: Mapped[str | None] = mapped_column(String(512), default=None)
+    buttons: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=False)
+    segment: Mapped[BroadcastSegment] = mapped_column(String(16), nullable=False)
+
+    status: Mapped[BroadcastStatus] = mapped_column(
+        String(16), default=BroadcastStatus.SCHEDULED, nullable=False
+    )
+    scheduled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    total_recipients: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sent_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Возобновление после падения контейнера: id последнего обработанного
+    # получателя и время последней отправки. Рассылка в статусе sending без
+    # свежего heartbeat подхватывается воркером с места остановки — без
+    # дублей тем, кто уже получил сообщение.
+    cursor_user_id: Mapped[int | None] = mapped_column(Integer, default=None)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+    created_by_admin_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admins.id", ondelete="SET NULL"), default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
