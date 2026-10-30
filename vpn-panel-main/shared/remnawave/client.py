@@ -107,6 +107,11 @@ class RemnawaveClient:
             for seg in _UI_ROUTES
         ):
             path = ""
+        elif low == "/api" or low.endswith("/api"):
+            # Запросы ниже уже включают /api. Если пользователь вставил
+            # адрес API целиком (https://panel.example.com/api), не добавляем
+            # этот сегмент второй раз. Префикс reverse proxy сохраняем.
+            path = path[:-4]
         clean = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
         self._client = httpx.AsyncClient(
